@@ -1,4 +1,5 @@
 (ns otplike.connector
+  (:refer-clojure :exclude [send])
   (:require 
    [clojure.core.match :refer [match]]
    [cognitect.transit :as transit]
@@ -443,6 +444,10 @@
   (gs/start-link-ns ::server
     [url opts]
     {:spawn-opt {:flags {:trap-exit true}}}))
+
+
+(defn send [k msg]
+  (! ::server [::route k msg]))
 
 
 (defn register [k]
