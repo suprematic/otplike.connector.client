@@ -16,7 +16,7 @@
   (process/spawn
     (process/proc-fn []
       (println "registering")
-      (connector/register [:name n])
+      (process/await! (connector/register< [:name n]))
       (println "waiting for message")
       (process/receive!
         [:hi! pid]
@@ -39,9 +39,9 @@
   (process/spawn
     (process/proc-fn []
       (println "registering")
-      (connector/register [:name n])
+      (process/await! (connector/register< [:name n]))
       (println "waiting for message")
-      (connector/unregister [:name n])
+      (process/await! (connector/unregister< [:name n]))
       (process/receive!
         _ :ok
         (after 2000

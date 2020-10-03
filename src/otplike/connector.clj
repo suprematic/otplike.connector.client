@@ -436,6 +436,17 @@
        ping-timeout-ms])))
 
 
+(defun handle-call
+  ([[::route dest msg] _from state]
+   [:reply :ok (route state dest msg)])
+
+  ([[::register pid ks] _from state]
+   [:reply :ok (register* state pid ks)])
+
+  ([[::unregister pid ks] _from state]
+   [:reply :ok (unregister* state pid ks)]))
+
+
 (defun handle-cast
   ([[:exit reason] state]
    (log "exit, reason:" reason)
@@ -479,13 +490,13 @@
     {:spawn-opt {:flags {:trap-exit true}}}))
 
 
-(defn send [k msg]
-  (! ::server [::route k msg]))
+(defn send< [k msg]
+  (gs/call ::server [::route k msg]))
 
 
-(defn register [k]
-  (! ::server [::register (process/self) [k]]))
+(defn register< [k]
+  (gs/call ::server [::register (process/self) [k]]))
 
 
-(defn unregister [k]
-  (! ::server [::unregister (process/self) [k]]))
+(defn unregister< [k]
+  (gs/call ::server [::unregister (process/self) [k]]))
