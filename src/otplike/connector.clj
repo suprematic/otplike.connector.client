@@ -115,44 +115,39 @@
      [:send dest msg]]))
 
 
-(defn- register-name [state pid reg-name]
+(defn- add-pending-name [state pid reg-name]
   (match (get-in state [:name->pid reg-name])
     nil
     (match (get-in state [:pending-name->pid reg-name])
       nil
-      (do
-        (log "registering name" :name reg-name :pid pid)
-        (process/link pid)
-        (-> state
-          (send-command [:register [[:name reg-name]]])
-          (assoc-in [:pending-name->pid reg-name] pid)
-          (update-in [:pending-pid->names pid] #(conj (or % #{} reg-name)))))
+      [:ok
+       (-> state
+         (assoc-in [:pending-name->pid reg-name] pid)
+         (update-in [:pending-pid->names pid] #(conj (or % #{} reg-name))))]
 
       pid
       (do
         (log "an attempt to register own name second time"
           :name reg-name :pid pid)
-        state) 
+        [:ok state])
 
       pending-pid
       (do
         (log "an attempt to register a name pending for another process"
           :name reg-name :pid pid :pending-pid pending-pid)
-        (process/exit pid [::unregistered [:name reg-name] :already-registered])
-        state))
+        [:error [::unregistered [:name reg-name] :already-registered]]))
 
     pid
     (do
       (log "an attempt to register own name second time"
         :name reg-name :pid pid)
-      state)
+      [:ok state])
 
     owner-pid
     (do
       (log "an attempt to register a name registered by another process"
         :name reg-name :pid pid :owner-pid owner-pid)
-      (process/exit pid [::unregistered [:name reg-name] :already-registered])
-      state)))
+      [:error [::unregistered [:name reg-name] :already-registered]])))
 
 
 (defn maybe-unlink [{:keys [pending-pid->name pid->names] :as state} pid]
@@ -193,27 +188,53 @@
     state))
 
 
-(defun- complete-registration
+(defun- complete-key-registration
   ([state ([:name reg-name] :as k)]
    (if-some [pid (-> state :pending-name->pid (get reg-name))]
      (do
-       (log "registration completed" :k k :pid pid)
+       (log "registration completed" :key k :pid pid)
        (-> state
          (remove-pending-name reg-name)
          (add-reg-name pid reg-name)))
      (if-some [owner-pid (-> state :name->pids (get reg-name))]
        (do
          (log "got registration completion for already completed registration"
-           :k k :owner-pid owner-pid)
+           :key k :owner-pid owner-pid)
          state)
        (do
-         (log "got registration completion for an unregistered key" :k k)
+         (log "got registration completion for an unregistered key" :key k)
          (send-command state [:unregister [[:name reg-name]]]))))))
 
 
-(defun- register*
+(defn- complete-registration [state ks]
+  (reduce complete-key-registration state ks))
+
+
+(defun- add-pending-key
   ([state pid [:name reg-name]]
-   (register-name state pid reg-name)))
+   (add-pending-name state pid reg-name))
+
+  ([_state _pid k]
+   [::invalid-key k]))
+
+
+(defn- register* [state pid ks]
+  (loop [new-state state
+         rest-ks ks]
+    (if (empty? rest-ks)
+      (do
+        (log "registering keys" :keys ks :pid pid)
+        (process/link pid)
+        (send-command new-state [:register ks]))
+      (let [k (first rest-ks)]
+        (match (add-pending-key new-state pid k)
+          [:ok next-state]
+          (recur next-state (rest ks))
+
+          [:error reason]
+          (do
+            (process/exit pid reason)
+            state))))))
 
 
 (defn- do-unregister-name [state pid reg-name]
@@ -261,12 +282,20 @@
       state)))
 
 
-(defun- unregister*
+(defun- unregister-key
   ([state pid [:name reg-name]]
-   (unregister-name state pid reg-name)))
+   (unregister-name state pid reg-name))
+
+  ([state pid k]
+   (log "an attempt to unregister an invalid key" :key k :pid pid)
+   state))
 
 
-(defn- unregister-all [state pid]
+(defn- unregister* [state pid ks]
+  (reduce #(unregister-key %1 pid %2) state ks))
+
+
+(defn- unregister-pid [state pid]
   (let [names (-> state :pid->names (get pid))
         pending-names (-> state :pending-pid->names (get pid))
         all-names (into names pending-names)]
@@ -276,7 +305,7 @@
       (reduce #(remove-reg-name %1 %2) state names))))
 
 
-(defun- fail-registration
+(defun- fail-key-registration
   ([state [:name reg-name] reason]
    (if-some [pid (get-in state [:pending-name->pid reg-name])]
      (let [state (remove-pending-name state reg-name)]
@@ -286,6 +315,10 @@
      (do
        (log "no process to unregister" :name reg-name)
        state))))
+
+
+(defn- fail-registration [state ks reason]
+  (reduce #(fail-key-registration %1 %2 reason) state ks))
 
 
 (defun- send*
@@ -300,15 +333,15 @@
 
 
 (defun- handle-command
-  ([[:registered k] state]
+  ([[:registered ks] state]
    (do
-     (log "got :registered" :k k)
-     (complete-registration state k)))
+     (log "got :registered" :keys ks)
+     (complete-registration state ks)))
 
-  ([[:unregister k reason] state]
+  ([[:unregister ks reason] state]
    (do
-     (log "got :unregister" :k k :reason reason)
-     (fail-registration state k reason)))
+     (log "got :unregister" :keys ks :reason reason)
+     (fail-registration state ks reason)))
 
   ([[:message [:send dest msg]] state]
    (log "got :message" :to dest :message msg)
@@ -325,7 +358,7 @@
    state)
 
   ([command state]
-   (log "unrecognized command" :command command)
+   (log "got unrecognized command" :command command)
    state))
 
 
@@ -419,15 +452,15 @@
   ([[::route dest msg] state]
    [:noreply (route state dest msg)])
 
-  ([[::register pid k] state]
-   [:noreply (register* state pid k)])
+  ([[::register pid ks] state]
+   [:noreply (register* state pid ks)])
 
-  ([[::unregister pid k] state]
-   [:noreply (unregister* state pid k)])
+  ([[::unregister pid ks] state]
+   [:noreply (unregister* state pid ks)])
 
   ([[:EXIT pid reason] state]
    (log "registered exit" :pid pid :reason reason)
-   [:noreply (unregister-all state pid)]))
+   [:noreply (unregister-pid state pid)]))
 
 
 (defn terminate [reason {:keys [ws] :as _state}]
@@ -451,8 +484,8 @@
 
 
 (defn register [k]
-  (! ::server [::register (process/self) k]))
+  (! ::server [::register (process/self) [k]]))
 
 
 (defn unregister [k]
-  (! ::server [::unregister (process/self) k]))
+  (! ::server [::unregister (process/self) [k]]))
