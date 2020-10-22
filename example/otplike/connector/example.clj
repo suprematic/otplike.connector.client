@@ -25,11 +25,35 @@
           (! pid :hi!))))))
 
 
+(defn test-monitor [n]
+  (process/spawn
+    (process/proc-fn []
+      (println "monitoring")
+      (process/monitor=> n)
+      (println "waiting for message")
+      (process/receive!
+        msg
+        (println "Hooray! Got my message!" msg)))))
+
+
+(defn test-monitoring-exit [n]
+  (process/spawn
+    (process/proc-fn []
+      (println "monitoring")
+      (process/monitor=> n)
+      (println "waiting for message")
+      (process/receive!
+        msg (println 'test-monitoring-exit "unexpected message" msg)
+
+        (after 1000
+          (println 'test-monitoring-exit "exiting"))))))
+
+
 (defn test-route [n]
   (process/spawn
     (process/proc-fn []
       (println "sending pid")
-      (! n [:hi! (process/self)])
+      (process/await! (connector/send< [:name n] [:hi! (process/self)]))
       (println "waiting for message")
       (process/receive!
         :hi! (println "Hooray! Got hi back!")))))

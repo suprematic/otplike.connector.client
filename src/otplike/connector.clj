@@ -5,6 +5,7 @@
    [cognitect.transit :as transit]
    [defun.core :refer [defun defun-]]
    [gniazdo.core :as ws]
+   [otplike.connector.monitors :as monitors]
    [otplike.gen-server :as gs]
    [otplike.process :as process :refer [!]])
   (:import
@@ -26,7 +27,7 @@
 
 
 (defn- log [& args]
-  (apply println "[connector] :: " args))
+  (apply println "[connector] ::" args))
 
 
 (def ^:private default-transit-write-handlers
@@ -123,7 +124,7 @@
       [:ok
        (-> state
          (assoc-in [:pending-name->pid reg-name] pid)
-         (update-in [:pending-pid->names pid] #(conj (or % #{} reg-name))))]
+         (update-in [:pending-pid->names pid] #(conj (or % #{}) reg-name)))]
 
       pid
       (do
@@ -332,6 +333,111 @@
    state))
 
 
+(defn- confirm-monitor [state mref node]
+  (update state :monitors monitors/confirm-pending mref node))
+
+
+(defn- fire-node-monitors [{:keys [monitors] :as state} node reason]
+  (doseq [{:keys [pid mref]} (monitors/get-node-monitors monitors node)]
+    (#'process/!control pid [:monitored-exit mref reason]))
+  (update state :monitors monitors/remove-node node))
+
+
+(defn- fire-pending-monitor [{:keys [monitors] :as state} mref reason]
+  (if-some [{:keys [pid]} (monitors/get-pending monitors mref)]
+    (do
+      (#'process/!control pid [:monitored-exit mref reason])
+      (update state :monitors monitors/remove-pending mref))
+    state))
+
+
+(defn- fire-confirmed-monitor [{:keys [monitors] :as state} mref reason]
+  (if-some [{:keys [pid]} (monitors/get-confirmed monitors mref)]
+    (do
+      (#'process/!control pid [:monitored-exit mref reason])
+      (update state :monitors monitors/remove-confirmed mref))
+    state))
+
+
+(defn- send-monitored [state k mref by-pid target]
+  (send-command state
+    [:route k
+     [:signal target [:monitored mref by-pid target]] {:confirm? true}]))
+
+
+(defn- send-demonitored [state node mref]
+  (send-command state [:route [:node node] [:signal nil [:demonitored mref]]]))
+
+
+(defn- monitor-remote* [state k ^TRef mref ^Pid by-pid target]
+  (-> state
+    (send-monitored k mref by-pid target)
+    (update :monitors monitors/add-pending mref by-pid target)))
+
+
+(defun- monitor-remote
+  ([state (pid :guard process/pid?) mref by-pid]
+   (monitor-remote* state [:node (.node ^Pid pid)] mref by-pid pid))
+
+  ([state reg-name mref by-pid]
+   (monitor-remote* state [:name reg-name] mref by-pid reg-name)))
+
+
+(defn- demonitor-remote [{:keys [monitors] :as state} mref]
+  (if-some [{:keys [node]} (monitors/get-confirmed monitors mref)]
+    (-> state
+      (send-demonitored node mref)
+      (update :monitors monitors/remove-pending mref)
+      (update :monitors monitors/remove-confirmed mref))
+    state))
+
+
+(defn- send-monitored-exit [state pid mref reason]
+  (send-command state
+    [:route [:node (.node pid)] [:signal pid [:monitored-exit mref reason]]]))
+
+
+(defn- monitor-local [state mref ^Pid remote-pid pid-or-name]
+  (if-some [local-pid
+            (if (process/pid? pid-or-name)
+              pid-or-name 
+              (-> state :name->pid (get pid-or-name)))]
+    (if (#'process/!control local-pid [:monitored mref remote-pid])
+      (if (process/local-pid? remote-pid)
+        (update state :monitors monitors/remove-pid remote-pid)
+        (update state :monitors monitors/add-monitored mref local-pid))
+      (send-monitored-exit state remote-pid mref :noproc))
+    (send-monitored-exit state remote-pid mref :noproc)))
+
+
+(defn- demonitor-local [state mref]
+  (if-some [pid (-> state :monitors (monitors/get-monitored mref))]
+    (do
+      (#'process/!control pid [:demonitored mref])
+      (update state :monitors monitors/remove-monitored mref))
+    state))
+
+
+(defun- handle-remote-signal
+  ([pid-or-name [:monitored mref remote-pid _target] state]
+   (monitor-local state mref remote-pid pid-or-name))
+
+  ([_pid-or-name [:demonitored mref] state]
+   (demonitor-local state mref))
+
+  ([_pid-or-name [:monitored-exit mref reason] state]
+   (fire-confirmed-monitor state mref reason)))
+
+
+(defun- handle-message
+  ([[:send dest msg] state]
+   (log "got :message" :to dest :message msg)
+   (send* state dest msg))
+
+  ([[:signal pid-or-name signal] state]
+   (handle-remote-signal pid-or-name signal state)))
+
+
 (defun- handle-command
   ([[:registered ks] state]
    (do
@@ -343,19 +449,21 @@
      (log "got :unregister" :keys ks :reason reason)
      (fail-registration state ks reason)))
 
-  ([[:message [:send dest msg]] state]
-   (log "got :message" :to dest :message msg)
-   (send* state dest msg))
+  ([[:message msg] state]
+   (log "got :message" :message msg)
+   (handle-message msg state))
 
-  ([[:no-route k msg] state]
+  ([[:routed k ([:signal _dest [:monitored mref _ _]] :as msg) node] state]
+   (log "got :routed" :key k :message msg)
+   (confirm-monitor state mref node))
+
+  ([[:no-route k ([:signal dest [:monitored mref _ _]] :as msg)] state]
    (log "got :no-route" :key k :message msg)
-   ;; TODO for linking/monitoring
-   state)
+   (fire-pending-monitor state mref :noproc))
 
-  ([[:node-down node-id] state]
-   (log "got :node-down" node-id)
-   ;; TODO for linking/monitoring
-   state)
+  ([[:node-down node] state]
+   (log "got :node-down" node)
+   (fire-node-monitors state node :node-down))
 
   ([command state]
    (log "got unrecognized command" :command command)
@@ -403,6 +511,61 @@
        ping-timeout-ms])))
 
 
+(defun- handle-signal
+  ([dest [:monitored mref by-pid] state]
+   (monitor-remote state dest mref by-pid))
+
+  ([pid [:monitored-exit mref reason] state]
+   (if (-> state :monitors (monitors/get-monitored mref))
+     (-> state
+       (send-monitored-exit pid mref reason)
+       (update :monitors monitors/remove-monitored mref))
+     state))
+
+  ([_ [:demonitored mref] state]
+   (demonitor-remote state mref)))
+
+
+(defun- reject-signal
+  ([[:monitored mref pid _k] state]
+   (#'process/!control pid [:monitored-exit mref :noproc])
+   state)
+
+  ([[:demonitored mref] state]
+   (-> state
+     (update :monitors monitors/remove-pending mref)
+     (update :monitors monitors/remove-confirmed mref))))
+
+
+(defn- process-signals [state signals]
+  (if-some [[dest signal] (first signals)]
+    (do
+      (log "processing signal" :dest dest :signal signal)
+      (let [state (handle-signal dest signal state)]
+        (recur state (rest signals))))
+    state))
+
+
+(defmacro log-fn [n]
+  `(let [f# ~n]
+     (defn ~n [& args#]
+       (println "=========================")
+       (log '~n "\n" (clojure.pprint/write args# :stream nil))
+       (let [res# (apply f# args#)]
+         (if (process/async? res#)
+           (process/async
+             (let [res# (process/await! res#)]
+               (println "  >>>")
+               (log '~n "\n" (clojure.pprint/write res# :stream nil))
+               (println "------------------")
+               res#))
+           (do
+             (println "  >>>")
+             (log '~n "\n" (clojure.pprint/write res# :stream nil))
+             (println "------------------")
+             res#))))))
+
+
 ;; ====================================================================
 ;; gen-server callbacks
 ;; ====================================================================
@@ -422,6 +585,7 @@
         (after 10000
           (process/exit :timeout)))
       (log "connected, node id " @node-id*)
+      (reset! @#'process/connector-signals* [])
       [:ok
        {:ws ws
         :ping-timeout-ms ping-timeout-ms
@@ -432,8 +596,10 @@
         :pending-name->pid {}
         :pending-pid->names {}
         :name->pid {}
+        :monitors (monitors/empty)
         :opts opts}
        ping-timeout-ms])))
+(log-fn init)
 
 
 (defun handle-call
@@ -445,6 +611,7 @@
 
   ([[::unregister pid ks] _from state]
    [:reply :ok (unregister* state pid ks)]))
+(log-fn handle-call)
 
 
 (defun handle-cast
@@ -454,6 +621,7 @@
 
   ([[:ws message] ({:ping-timeout-ms ping-timeout-ms} :as state)]
    [:noreply (handle-ws-message state message) ping-timeout-ms]))
+(log-fn handle-cast)
 
 
 (defun handle-info
@@ -463,20 +631,24 @@
   ([[::route dest msg] state]
    [:noreply (route state dest msg)])
 
-  ([[::register pid ks] state]
-   [:noreply (register* state pid ks)])
-
-  ([[::unregister pid ks] state]
-   [:noreply (unregister* state pid ks)])
+  ([::signal state]
+   (let [[signals] (reset-vals! @#'process/connector-signals* [])
+         state (process-signals state signals)]
+     [:noreply state]))
 
   ([[:EXIT pid reason] state]
    (log "registered exit" :pid pid :reason reason)
    [:noreply (unregister-pid state pid)]))
+(log-fn handle-info)
 
 
-(defn terminate [reason {:keys [ws] :as _state}]
+(defn terminate [reason {:keys [ws] :as state}]
   (log "stopping, reason" reason)
-  (ws/close ws))
+  (ws/close ws)
+  (let [[msgs] (reset-vals! @#'process/connector-signals* nil)]
+    (doseq [m msgs]
+      (reject-signal m state))))
+(log-fn terminate)
 
 
 ;; =================================================================
